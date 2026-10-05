@@ -316,6 +316,8 @@ $('#submit').onclick=submitIt; $('#reread').onclick=reread; $('#relist').onclick
 
 /* ---------------- rendering ---------------- */
 function banner(kind, html){ $('#banner').innerHTML=`<div class="banner ${kind}">${html}</div>`; }
+function esc(s){ return String(s).replace(/[&<>"']/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 function snapHtml(snap){
   if(!snap) return '<div class="muted">裁决在此冻结，无后续快照（本次提交的旧成功全部作废）。</div>';
@@ -355,6 +357,8 @@ function renderVerdict(rec){
       <span class="frozen">按规则定位该事件并清除本次提交此前所有旧成功；之后不再执行。
       输入指纹 <span class="mono">${rec.inputHash.slice(0,20)}…</span></span></div>`;
   }
+  const taskOpts=((v.steps[0]&&v.steps[0].snapshot)?v.steps[0].snapshot.tasks:[])
+    .map(t=>`<option value="${t.id}">任务 ${t.id}（基准 ${t.basePriority}）</option>`).join('');
   const steps=v.steps.map(s=>{
     const ev = s.raw?JSON.stringify(s.raw):'';
     return `<div class="step ${s.ok?'':'fail'} ${s.type==='init'?'init':''}">
@@ -368,7 +372,59 @@ function renderVerdict(rec){
       <div class="step-body">${snapHtml(s.snapshot)}</div></div>`;
   }).join('');
   $('#result').innerHTML = head + `<section class="card" style="margin-top:12px">
+    <h2>继承区间复核（有效优先级偏离基准的连续时段）</h2>
+    <div class="row">
+      <label for="winTask">选择该审计中已存在的任务</label>
+      <select id="winTask">${taskOpts}</select>
+      <button class="ghost" id="winRun">分析继承区间</button>
+    </div>
+    <div id="winResult"></div></section>`
+    + `<section class="card" style="margin-top:12px">
     <h2>逐步快照（点击每步可折叠）</h2>${steps}</section>`;
+  $('#winRun').onclick=()=>analyzeWindows(rec.auditId);
+}
+
+/* -------- inheritance windows (GET /api/verdicts/<id>/inheritance-windows) -------- */
+async function analyzeWindows(auditId){
+  const box=$('#winResult');
+  box.innerHTML='';                       // 每次查询先清空，绝不留上次结果
+  const taskId=$('#winTask').value;
+  let res,data;
+  try{
+    res=await fetch('/api/verdicts/'+encodeURIComponent(auditId)
+      +'/inheritance-windows?taskId='+encodeURIComponent(taskId));
+    data=await res.json();
+  }catch(err){
+    box.innerHTML=`<div class="banner err">❌ 网络错误：${esc(err)}</div>`; return;
+  }
+  if(!res.ok){
+    box.innerHTML=`<div class="banner err">❌ ${esc(data.message||'查询失败')}</div>`; return;
+  }
+  renderWindows(data);
+}
+function renderWindows(data){
+  const box=$('#winResult');
+  if(!data.windows.length){
+    box.innerHTML=`<div class="banner ok">✅ 任务 ${data.taskId} 全程有效优先级等于基准
+      （基准 ${data.basePriority}），未发生优先级继承，无偏离时段。</div>`;
+    return;
+  }
+  const evTxt=e=>`#${e.index} ${esc(e.type)}${e.raw?' '+esc(JSON.stringify(e.raw)):'（初始快照）'}`;
+  const evd=e=>`等待链 ${e.chains.length?e.chains.map(c=>esc(c.join(' → '))).join('；'):'无'}
+    · 继承自 [${e.inheritedFrom.join(', ')}] · 有效 ${e.effectivePriority} / 基准 ${e.basePriority}`;
+  box.innerHTML=data.windows.map((w,i)=>`<div class="step">
+    <div class="step-head" style="cursor:default">
+      <span class="idx">时段 ${i+1}</span>
+      <span class="pill acquire">事件 #${w.startIndex} → #${w.endIndex}</span>
+      <span>最紧急继承优先级 <b class="eff-boost">${w.peakInheritedPriority}</b></span>
+      <span class="muted">来源任务 [${w.sourceTasks.join(', ')}]</span>
+    </div>
+    <div class="step-body">
+      <div class="chain">起点事件：${evTxt(w.startEvent)}</div>
+      <div class="chain">终点事件：${evTxt(w.endEvent)}</div>
+      <div class="chain">起点证据（快照 #${w.startEvidence.stepIndex}）：${evd(w.startEvidence)}</div>
+      <div class="chain">终点证据（快照 #${w.endEvidence.stepIndex}）：${evd(w.endEvidence)}</div>
+    </div></div>`).join('');
 }
 
 /* ---------------- boot ---------------- */

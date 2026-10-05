@@ -272,6 +272,139 @@ class InvalidEventTests(unittest.TestCase):
         self.assert_rejected_at(r, 3)
 
 
+class InheritanceWindowTests(unittest.TestCase):
+    """Off-base inheritance windows via the store's real query path."""
+
+    TWOHOP = {
+        "auditId": "WIN-TWOHOP",
+        "tasks": [{"id": 1, "priority": 8}, {"id": 2, "priority": 5}, {"id": 3, "priority": 1}],
+        "locks": [{"id": 1, "priority": 9}, {"id": 2, "priority": 9}],
+        "events": [
+            {"type": "acquire", "taskId": 2, "lockId": 2},
+            {"type": "acquire", "taskId": 1, "lockId": 1},
+            {"type": "acquire", "taskId": 2, "lockId": 1},
+            {"type": "acquire", "taskId": 3, "lockId": 2},
+            {"type": "release", "taskId": 1, "lockId": 1},
+            {"type": "release", "taskId": 2, "lockId": 1},
+            {"type": "release", "taskId": 2, "lockId": 2},
+        ],
+    }
+    FALLBACK = {
+        "auditId": "WIN-FALLBACK",
+        "tasks": [{"id": 1, "priority": 8}, {"id": 2, "priority": 1}],
+        "locks": [{"id": 1, "priority": 9}],
+        "events": [
+            {"type": "acquire", "taskId": 1, "lockId": 1},
+            {"type": "acquire", "taskId": 2, "lockId": 1},
+            {"type": "release", "taskId": 1, "lockId": 1},
+            {"type": "release", "taskId": 2, "lockId": 1},
+        ],
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = VerdictStore(os.path.join(self.tmp.name, "verdicts.json"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def submit(self, spec):
+        rec, status = self.store.submit(normalize(spec))
+        self.assertEqual(status, 200)
+        return rec
+
+    def windows(self, audit_id, task_id):
+        body, status = self.store.inheritance_windows(audit_id, task_id)
+        self.assertEqual(status, 200, body)
+        return body
+
+    def test_twohop_window_for_middle_task(self):
+        self.submit(self.TWOHOP)
+        body = self.windows("WIN-TWOHOP", 2)
+        self.assertEqual(body["basePriority"], 5)
+        self.assertEqual(len(body["windows"]), 1)
+        w = body["windows"][0]
+        # Boosted by C from step 4 until B releases L2 at step 7.
+        self.assertEqual((w["startIndex"], w["endIndex"]), (4, 6))
+        self.assertEqual(w["peakInheritedPriority"], 1)
+        self.assertEqual(w["sourceTasks"], [3])
+        self.assertEqual(w["startEvent"]["index"], 4)
+        self.assertEqual(w["startEvent"]["type"], "acquire")
+        self.assertEqual(w["endEvent"]["index"], 6)
+        self.assertEqual(w["endEvent"]["type"], "release")
+        # Boundary evidence is cross-checkable against the step snapshots.
+        self.assertEqual(w["startEvidence"]["stepIndex"], 4)
+        self.assertIn([3, 2, 1], w["startEvidence"]["chains"])
+        self.assertIn([2, 1], w["startEvidence"]["chains"])
+        self.assertEqual(w["startEvidence"]["effectivePriority"], 1)
+        self.assertEqual(w["endEvidence"]["stepIndex"], 6)
+        self.assertIn([3, 2], w["endEvidence"]["chains"])
+
+    def test_window_merges_across_source_change(self):
+        # Task 1 deviates at step 3 (source {2}) and step 4 (sources {2,3});
+        # the source set changes mid-window but it stays one window.
+        self.submit(self.TWOHOP)
+        body = self.windows("WIN-TWOHOP", 1)
+        self.assertEqual(len(body["windows"]), 1)
+        w = body["windows"][0]
+        self.assertEqual((w["startIndex"], w["endIndex"]), (3, 4))
+        self.assertEqual(w["peakInheritedPriority"], 1)
+        self.assertEqual(w["sourceTasks"], [2, 3])  # first-appearance order
+        self.assertEqual(w["startEvidence"]["inheritedFrom"], [2])
+        self.assertIn([2, 1], w["startEvidence"]["chains"])
+        self.assertEqual(w["endEvidence"]["inheritedFrom"], [2, 3])
+        self.assertIn([3, 2, 1], w["endEvidence"]["chains"])
+
+    def test_fallback_window_ends_at_release(self):
+        self.submit(self.FALLBACK)
+        body = self.windows("WIN-FALLBACK", 1)
+        self.assertEqual(len(body["windows"]), 1)
+        w = body["windows"][0]
+        self.assertEqual((w["startIndex"], w["endIndex"]), (2, 2))
+        self.assertEqual(w["peakInheritedPriority"], 1)
+        self.assertEqual(w["sourceTasks"], [2])
+        self.assertEqual(w["startEvent"]["type"], "acquire")
+        self.assertEqual(w["endEvent"]["type"], "acquire")
+
+    def test_task_without_inheritance_has_no_windows(self):
+        self.submit(self.TWOHOP)
+        body = self.windows("WIN-TWOHOP", 3)  # base 1, never boosted
+        self.assertEqual(body["windows"], [])
+        self.assertEqual(body["basePriority"], 1)
+
+    def test_unknown_task_is_actionable_404(self):
+        self.submit(self.TWOHOP)
+        body, status = self.store.inheritance_windows("WIN-TWOHOP", 99)
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "task_not_found")
+        self.assertEqual(body["knownTasks"], [1, 2, 3])
+        self.assertIn("99", body["message"])
+
+    def test_frozen_verdict_has_no_snapshots_to_analyze(self):
+        bad = normalize({
+            "auditId": "WIN-FROZEN",
+            "tasks": [{"id": 1, "priority": 8}, {"id": 2, "priority": 5}],
+            "locks": [{"id": 1, "priority": 9}],
+            "events": [
+                {"type": "acquire", "taskId": 1, "lockId": 1},
+                {"type": "release", "taskId": 2, "lockId": 1},
+            ],
+        })
+        rec, status = self.store.submit(bad)
+        self.assertEqual(status, 200)
+        self.assertFalse(rec["verdict"]["accepted"])
+        body, status = self.store.inheritance_windows("WIN-FROZEN", 1)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "verdict_frozen")
+        self.assertEqual(body["errorIndex"], 2)
+
+    def test_unknown_audit_id_is_404(self):
+        body, status = self.store.inheritance_windows("WIN-MISSING", 1)
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "not_found")
+        self.assertIn("WIN-MISSING", body["message"])
+
+
 class StoreTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

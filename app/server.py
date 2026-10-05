@@ -8,6 +8,8 @@ GET  /static/*                     static assets
 POST /api/verdicts                 submit (freeze) / replay / conflict
 GET  /api/verdicts                 list frozen verdicts
 GET  /api/verdicts/<auditId>       re-read a frozen verdict
+GET  /api/verdicts/<auditId>/inheritance-windows?taskId=N
+                                   off-base inheritance windows of one task
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import os
 import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -82,11 +84,15 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/verdicts":
             self._send_json({"verdicts": store.list()})
         elif path.startswith("/api/verdicts/"):
-            audit_id = unquote(path[len("/api/verdicts/") :])
-            record = store.get(audit_id)
+            rest = unquote(path[len("/api/verdicts/") :])
+            if rest.endswith("/inheritance-windows"):
+                audit_id = rest[: -len("/inheritance-windows")]
+                self._inheritance_windows(audit_id, parts.query)
+                return
+            record = store.get(rest)
             if record is None:
                 self._send_json(
-                    {"error": "not_found", "message": f"审计标识 {audit_id} 无冻结裁决"}, 404
+                    {"error": "not_found", "message": f"审计标识 {rest} 无冻结裁决"}, 404
                 )
             else:
                 self._send_json(record)
@@ -94,6 +100,26 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "not_found", "message": "未知 API"}, 404)
         else:
             self._send_static(path if path != "/" else "")
+
+    def _inheritance_windows(self, audit_id: str, query: str) -> None:
+        params = parse_qs(query)
+        raw = params.get("taskId", [None])[0]
+        if raw is None:
+            self._send_json(
+                {"error": "bad_request", "message": "缺少 taskId 查询参数，"
+                 "用法：/api/verdicts/<auditId>/inheritance-windows?taskId=<整数>"},
+                400,
+            )
+            return
+        try:
+            task_id = int(raw)
+        except ValueError:
+            self._send_json(
+                {"error": "bad_request", "message": f"taskId 必须是整数，收到 {raw!r}"}, 400
+            )
+            return
+        body, status = store.inheritance_windows(audit_id, task_id)
+        self._send_json(body, status)
 
     def do_POST(self) -> None:  # noqa: N802
         parts = urlsplit(self.path)

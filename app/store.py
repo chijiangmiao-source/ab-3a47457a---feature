@@ -13,6 +13,7 @@ import os
 import threading
 from datetime import datetime, timezone
 
+from analysis import inheritance_windows
 from engine import Engine, MAX_EVENTS, MAX_LOCKS, MAX_TASKS, VALID_EVENT_TYPES
 
 
@@ -180,6 +181,51 @@ class VerdictStore:
         with self._lock:
             record = self._records.get(audit_id)
             return self._public(record, replayed=True) if record else None
+
+    def inheritance_windows(self, audit_id: str, task_id: int) -> tuple[dict, int]:
+        """Off-base inheritance windows for one task of a frozen verdict.
+
+        Returns (body, http_status).  Failures are actionable: the caller is
+        told which audits/tasks exist or why the frozen verdict has no
+        snapshots to analyze.
+        """
+        with self._lock:
+            record = self._records.get(audit_id)
+            if record is None:
+                return (
+                    {
+                        "error": "not_found",
+                        "message": f"审计标识 {audit_id} 无冻结裁决，读取范围不存在；"
+                        "请先提交该审计或核对标识",
+                    },
+                    404,
+                )
+            verdict = record["verdict"]
+            if not verdict["accepted"]:
+                return (
+                    {
+                        "error": "verdict_frozen",
+                        "auditId": audit_id,
+                        "errorIndex": verdict["errorIndex"],
+                        "message": f"审计 {audit_id} 因第 {verdict['errorIndex']} 项事件非法被冻结，"
+                        "无完整快照序列，无法分析继承区间；请修正事件后换用新审计标识重新提交",
+                    },
+                    409,
+                )
+            known = [t["id"] for t in record["input"]["tasks"]]
+            if task_id not in known:
+                return (
+                    {
+                        "error": "task_not_found",
+                        "auditId": audit_id,
+                        "knownTasks": known,
+                        "message": f"任务 {task_id} 在审计 {audit_id} 中不存在，"
+                        f"可复核的任务为 {known}",
+                    },
+                    404,
+                )
+            result = inheritance_windows(verdict, task_id)
+            return {"auditId": audit_id, **result}, 200
 
     def list(self) -> list[dict]:
         with self._lock:

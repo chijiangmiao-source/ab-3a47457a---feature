@@ -27,8 +27,15 @@
 | `POST` | `/api/verdicts` | 提交：首次冻结 / 相同回放 / 不同 409 |
 | `GET`  | `/api/verdicts` | 冻结裁决索引 |
 | `GET`  | `/api/verdicts/<auditId>` | 按标识重新读取冻结裁决与每步快照 |
+| `GET`  | `/api/verdicts/<auditId>/inheritance-windows?taskId=N` | 任务 N 有效优先级偏离基准的连续继承时段 |
 | `GET`  | `/health` | 健康响应 |
 | `GET`  | `/` | 裁决台网页（真实调用上述 API） |
+
+继承时段（inheritance-windows）把某任务"有效优先级 ≠ 基准优先级"的连续步归并成段：
+相邻快照即使继承来源改变也不拆段；每段给出起止事件、段内最紧急的继承优先级、
+起点/终点可对照逐步快照复核的等待链证据，以及段内按首次出现顺序去重的来源任务。
+任务不存在（404，附可选任务列表）、裁决因非法事件冻结无快照（409）、审计标识
+不存在（404）、缺 `taskId`（400）均返回可操作的失败说明。
 
 提交体：
 
@@ -80,10 +87,11 @@ docker compose logs verify
 
 ```
 app/engine.py          裁决状态机（继承图、移交、非法事件定位）
+app/analysis.py        继承时段归并（偏离基准的连续区间、边界证据）
 app/store.py           输入规范化、指纹、冻结/回放/冲突、持久化
 app/server.py          HTTP API + 静态页
-app/static/index.html  裁决台（编辑/预设/提交/回放/逐步快照）
-tests/test_rules.py    规则单测（21 项）
+app/static/index.html  裁决台（编辑/预设/提交/回放/逐步快照/继承区间复核）
+tests/test_rules.py    规则单测（28 项）
 verify/run_verify.py   verify 容器入口（测试+构建+冒烟，退出码报告）
 Dockerfile, docker-compose.yml
 ```

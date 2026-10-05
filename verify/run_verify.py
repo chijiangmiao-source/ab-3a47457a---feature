@@ -13,6 +13,9 @@ Runs, in order:
    - invalid-event localization + old-success clearing
    - same-input replay and different-input conflict (409)
    - frozen verdict re-read
+   - inheritance windows: two-hop merge across source change, release
+     fallback boundary, never-inheriting task, and actionable failures
+     (unknown task / frozen verdict / unknown audit / missing taskId)
 
 Exits 0 only when every phase passes; non-zero otherwise. Compose reports the
 status code via the container's exit status.
@@ -238,6 +241,58 @@ def smoke() -> None:
           and "不存在" in v.get("error", ""),
           "api: unknown object reference located and frozen at index 1",
           f"{v.get('error')}")
+
+    # --- inheritance windows: two-hop, source change merged into one window --
+    status, body = http("GET", "/api/verdicts/VERIFY-TWOHOP/inheritance-windows?taskId=1")
+    wins = body.get("windows", [])
+    ok = (
+        status == 200 and body.get("taskId") == 1 and body.get("basePriority") == 8
+        and len(wins) == 1
+        and (wins[0]["startIndex"], wins[0]["endIndex"]) == (3, 4)
+        and wins[0]["peakInheritedPriority"] == 1
+        and wins[0]["sourceTasks"] == [2, 3]  # merged despite source change
+        and wins[0]["startEvent"]["type"] == "acquire"
+        and wins[0]["endEvent"]["type"] == "acquire"
+        and [2, 1] in wins[0]["startEvidence"]["chains"]
+        and [3, 2, 1] in wins[0]["endEvidence"]["chains"]
+    )
+    check(ok, "api: inheritance windows merge across source change (two-hop task 1)",
+          f"windows={wins}")
+
+    # --- inheritance windows: fallback ends right at the release ------------
+    status, body = http("GET", "/api/verdicts/VERIFY-FALLBACK/inheritance-windows?taskId=1")
+    wins = body.get("windows", [])
+    ok = (
+        status == 200 and len(wins) == 1
+        and (wins[0]["startIndex"], wins[0]["endIndex"]) == (2, 2)
+        and wins[0]["peakInheritedPriority"] == 1
+        and wins[0]["sourceTasks"] == [2]
+    )
+    check(ok, "api: inheritance window falls back after release handover",
+          f"windows={wins}")
+
+    # --- inheritance windows: task that never inherits ----------------------
+    status, body = http("GET", "/api/verdicts/VERIFY-TWOHOP/inheritance-windows?taskId=3")
+    check(status == 200 and body.get("windows") == [],
+          "api: task without inheritance yields zero windows", f"status={status}")
+
+    # --- inheritance windows: actionable failures ---------------------------
+    status, body = http("GET", "/api/verdicts/VERIFY-TWOHOP/inheritance-windows?taskId=99")
+    check(status == 404 and body.get("error") == "task_not_found"
+          and body.get("knownTasks") == [1, 2, 3],
+          "api: unknown task -> 404 with selectable task list", f"status={status}")
+
+    status, body = http("GET", "/api/verdicts/VERIFY-INVALID/inheritance-windows?taskId=1")
+    check(status == 409 and body.get("error") == "verdict_frozen",
+          "api: frozen (invalid) verdict has no snapshots -> 409", f"status={status}")
+
+    status, body = http("GET", "/api/verdicts/VERIFY-MISSING/inheritance-windows?taskId=1")
+    check(status == 404 and body.get("error") == "not_found",
+          "api: unknown audit id -> 404", f"status={status}")
+
+    status, body = http("GET", "/api/verdicts/VERIFY-TWOHOP/inheritance-windows")
+    check(status == 400 and body.get("error") == "bad_request",
+          "api: missing taskId -> 400", f"status={status}")
 
 
 def main() -> int:
