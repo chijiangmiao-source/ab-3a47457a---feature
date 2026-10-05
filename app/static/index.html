@@ -65,6 +65,15 @@
   .frozen { font-size:12px; color:var(--muted); }
   .muted { color:var(--muted); }
   .mono { font-variant-numeric:tabular-nums; }
+  .interval { border:1px solid var(--line); border-radius:8px; margin:10px 0; padding:10px 14px;
+    background:var(--panel2); }
+  .interval h3 { margin:0 0 6px; font-size:13px; color:var(--ok); }
+  .evidence { border-left:3px solid var(--warn); padding:4px 10px; margin:6px 0;
+    background:rgba(255,180,84,.06); border-radius:0 6px 6px 0; font-size:12px; }
+  .evidence b { color:var(--warn); }
+  .src-tag { display:inline-block; background:#1d3a5f; color:#8ec5ff; border-radius:10px;
+    padding:0 8px; margin:1px 3px 1px 0; font-size:11.5px; }
+  .ev-pill { padding:0 7px; border-radius:10px; font-size:11px; background:#333c4d; color:#a9b6c9; }
   @media (max-width: 900px){ .grid,.snap-grid{grid-template-columns:1fr;} }
 </style>
 </head>
@@ -125,6 +134,7 @@
   </section>
 
   <section id="result"></section>
+  <section id="auditPanel"></section>
 
   <section class="card" style="margin-top:16px">
     <h2>冻结裁决索引</h2>
@@ -270,6 +280,7 @@ function payload(){
 }
 async function submitIt(){
   $('#banner').innerHTML=''; $('#status').textContent='提交中…';
+  $('#auditPanel').innerHTML='';
   try{
     const res=await fetch('/api/verdicts',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});
@@ -291,6 +302,7 @@ async function submitIt(){
 async function reread(){
   const id=$('#auditId').value.trim();
   if(!id){banner('warn','请先填写审计标识');return;}
+  $('#auditPanel').innerHTML='';
   const res=await fetch('/api/verdicts/'+encodeURIComponent(id));
   const data=await res.json();
   if(!res.ok){$('#status').textContent='未找到';banner('err','❌ '+data.message);return;}
@@ -357,7 +369,7 @@ function renderVerdict(rec){
   }
   const steps=v.steps.map(s=>{
     const ev = s.raw?JSON.stringify(s.raw):'';
-    return `<div class="step ${s.ok?'':'fail'} ${s.type==='init'?'init':''}">
+    return `<div class="step ${s.ok?'':'fail'} ${s.type==='init'?'init':''}" id="step-${s.index}">
       <div class="step-head" onclick="this.nextElementSibling.style.display=
         this.nextElementSibling.style.display==='none'?'block':'none'">
         <span class="idx">#${s.index}</span>
@@ -369,6 +381,121 @@ function renderVerdict(rec){
   }).join('');
   $('#result').innerHTML = head + `<section class="card" style="margin-top:12px">
     <h2>逐步快照（点击每步可折叠）</h2>${steps}</section>`;
+  renderAuditPanel(rec);
+}
+
+/* ---------------- inheritance-interval audit ---------------- */
+const esc=s=>String(s).replace(/[&<>"']/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let auditRec=null;
+
+function renderAuditPanel(rec){
+  auditRec=rec;
+  const v=rec.verdict;
+  if(!v.accepted){
+    $('#auditPanel').innerHTML=`<section class="card" style="margin-top:16px">
+      <h2>④ 继承时段审计</h2>
+      <div class="banner err">⛔ 该裁决因第 ${v.errorIndex} 项事件非法而冻结，
+        此前旧成功均已作废且无完整快照，<b>不存在可审计的继承时段范围</b>。<br>
+        <span class="frozen">请修正事件序列后使用新的审计标识重新提交，再进行继承时段审计。</span></div>
+    </section>`;
+    return;
+  }
+  const init=v.steps?.[0]?.snapshot;
+  if(!init){ $('#auditPanel').innerHTML=''; return; }
+  const opts=init.tasks.map(t=>
+    `<option value="${t.id}">任务 ${t.id}（基准优先级 ${t.basePriority}）</option>`).join('');
+  $('#auditPanel').innerHTML=`<section class="card" style="margin-top:16px">
+    <h2>④ 继承时段审计 · 有效优先级连续偏离基准优先级的事件区间</h2>
+    <div class="row">
+      <label for="auditTask">选择已有任务</label>
+      <select id="auditTask"><option value="">— 请选择任务 —</option>${opts}</select>
+      <button id="auditQuery">查询连续继承时段</button>
+      <span id="auditStatus" class="muted"></span>
+    </div>
+    <div id="auditBanner"></div>
+    <div id="auditResult"></div>
+  </section>`;
+  $('#auditTask').onchange=()=>{ $('#auditBanner').innerHTML=''; $('#auditResult').innerHTML=''; };
+  $('#auditQuery').onclick=queryInheritance;
+}
+
+function auditFail(text){
+  // A failed audit must never leave the previous query on screen.
+  $('#auditBanner').innerHTML=`<div class="banner err">${esc(text)}</div>`;
+  $('#auditResult').innerHTML='';
+}
+
+async function queryInheritance(){
+  const tid=$('#auditTask').value;
+  $('#auditBanner').innerHTML=''; $('#auditResult').innerHTML='';
+  if(!tid){ auditFail('请先从该裁决已有任务中选择一项，再查询继承时段。'); return; }
+  $('#auditStatus').textContent='审计查询中…';
+  try{
+    const url='/api/verdicts/'+encodeURIComponent(auditRec.auditId)+
+      '/inheritance?taskId='+encodeURIComponent(tid);
+    const res=await fetch(url);
+    const data=await res.json();
+    if(!res.ok){
+      $('#auditStatus').textContent='审计失败（HTTP '+res.status+'）';
+      let hint=data.message||'审计查询失败。';
+      if(data.availableTaskIds && data.availableTaskIds.length)
+        hint+=' 可选择的已有任务：'+data.availableTaskIds.join(', ')+'。';
+      if(res.status===409 && data.errorIndex!=null)
+        hint+=' 请修正第 '+data.errorIndex+' 项非法事件后，使用新的审计标识重新提交。';
+      if(res.status===404)
+        hint+=' 可点击“按标识重新读取”或重新提交以取得冻结裁决。';
+      auditFail(hint);
+      return;
+    }
+    $('#auditStatus').textContent='审计完成';
+    renderReport(data.report);
+  }catch(err){
+    $('#auditStatus').textContent='网络错误';
+    auditFail('网络错误，未取得审计结果：'+err+'。可重试查询。');
+  }
+}
+
+function evidenceHtml(label,e){
+  const t=e.taskState;
+  const state=t.state==='waiting'
+    ? '等待锁 '+t.waitingFor
+    : '运行'+(t.holdingLocks.length?' · 持锁 ['+t.holdingLocks.join(',')+']':' · 未持锁');
+  const chains=e.waitChains.length
+    ? e.waitChains.map(c=>'<div class="chain">可复核等待链：'+c.join(' → ')+
+        '（等待者→持有者…）</div>').join('')
+    : '<div class="muted">该步快照中无经过任务 '+t.id+' 的完整等待链，可对照上方该步快照的持锁与等待队列复核。</div>';
+  return `<div class="evidence"><b>${label} · 事件 #${e.stepIndex}</b>
+      <span class="ev-pill">${esc(e.eventType)}</span> ${esc(e.detail)}
+      <div>事件原文：<span class="mono">${esc(JSON.stringify(e.event))}</span></div>
+      <div>任务 ${t.id}：基准优先级 ${t.basePriority}，有效优先级 <b style="color:var(--ok)">${
+        t.effectivePriority}</b>（${state}）；快照继承来源 [${
+        t.inheritedFrom.join(',')||'无'}]</div>
+      ${chains}</div>`;
+}
+
+function renderReport(r){
+  const box=$('#auditResult');
+  if(!r.intervalCount){
+    box.innerHTML=`<div class="banner ok">✅ 任务 ${r.taskId} 在整段轨迹的全部事件快照中，
+      有效优先级始终等于基准优先级 ${r.basePriority}，<b>未发生优先级继承</b>。</div>`;
+    return;
+  }
+  const html=r.intervals.map((seg,i)=>`<div class="interval">
+    <h3>继承时段 ${i+1}：事件 #${seg.startEventIndex} → 事件 #${seg.endEventIndex}
+      <span class="muted" style="font-weight:400">（连续 ${
+        seg.endEventIndex-seg.startEventIndex+1} 个事件快照）</span></h3>
+    <div>该段最紧急的继承优先级：<b style="color:var(--ok)">${
+      seg.mostUrgentPriority}</b>
+      <span class="muted">（基准 ${r.basePriority}，数值越小越紧急）</span></div>
+    <div style="margin:4px 0">段内来源任务（按首次出现顺序去重）：${
+      seg.sourceTaskIds.map(s=>`<span class="src-tag">任务 ${s}</span>`).join('')}</div>
+    ${evidenceHtml('起点证据',seg.startEvidence)}
+    ${evidenceHtml('终点证据',seg.endEvidence)}
+  </div>`).join('');
+  box.innerHTML=`<div class="banner ok">✅ 任务 ${r.taskId}（基准优先级 ${
+      r.basePriority}）在整段轨迹中共出现 <b>${r.intervalCount}</b> 段连续继承区间。
+    相邻快照间即使继承来源改变，只要有效优先级连续偏离基准即归入同一时段。</div>${html}`;
 }
 
 /* ---------------- boot ---------------- */

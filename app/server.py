@@ -2,12 +2,13 @@
 
 Endpoints
 ---------
-GET  /health                       liveness probe
-GET  /                             web console
-GET  /static/*                     static assets
-POST /api/verdicts                 submit (freeze) / replay / conflict
-GET  /api/verdicts                 list frozen verdicts
-GET  /api/verdicts/<auditId>       re-read a frozen verdict
+GET  /health                                              liveness probe
+GET  /                                                    web console
+GET  /static/*                                            static assets
+POST /api/verdicts                                        submit (freeze) / replay / conflict
+GET  /api/verdicts                                        list frozen verdicts
+GET  /api/verdicts/<auditId>                              re-read a frozen verdict
+GET  /api/verdicts/<auditId>/inheritance?taskId=<id>      inheritance-interval audit
 """
 
 from __future__ import annotations
@@ -17,10 +18,11 @@ import os
 import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from inheritance import AuditError, inheritance_report  # noqa: E402
 from store import ValidationError, VerdictStore, normalize  # noqa: E402
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -82,11 +84,20 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/verdicts":
             self._send_json({"verdicts": store.list()})
         elif path.startswith("/api/verdicts/"):
-            audit_id = unquote(path[len("/api/verdicts/") :])
-            record = store.get(audit_id)
+            raw_remainder = path[len("/api/verdicts/") :]
+            if "/" in raw_remainder:
+                raw_audit, sub_resource = raw_remainder.split("/", 1)
+                audit_id = unquote(raw_audit)
+                if sub_resource == "inheritance":
+                    self._handle_inheritance(audit_id, parts.query)
+                    return
+                self._send_json({"error": "not_found", "message": "未知子资源"}, 404)
+                return
+            record = store.get(unquote(raw_remainder))
             if record is None:
                 self._send_json(
-                    {"error": "not_found", "message": f"审计标识 {audit_id} 无冻结裁决"}, 404
+                    {"error": "not_found", "message": f"审计标识 {unquote(raw_remainder)} 无冻结裁决"},
+                    404,
                 )
             else:
                 self._send_json(record)
@@ -94,6 +105,45 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "not_found", "message": "未知 API"}, 404)
         else:
             self._send_static(path if path != "/" else "")
+
+    def _handle_inheritance(self, audit_id: str, query: str) -> None:
+        record = store.get(audit_id)
+        if record is None:
+            self._send_json(
+                {"error": "not_found", "message": f"审计标识 {audit_id} 无冻结裁决，无法审计继承时段。"},
+                404,
+            )
+            return
+        params = parse_qs(query)
+        raw_tid = (params.get("taskId") or [""])[0].strip()
+        try:
+            tid = int(raw_tid)
+        except (TypeError, ValueError):
+            self._send_json(
+                {
+                    "error": "bad_request",
+                    "message": f"taskId 必须是已有任务的整数 id，收到 {raw_tid!r}。",
+                    "auditId": audit_id,
+                },
+                400,
+            )
+            return
+        try:
+            report = inheritance_report(record["verdict"], tid)
+        except AuditError as exc:
+            self._send_json(
+                {**exc.extra, "error": exc.code, "message": exc.message, "auditId": audit_id},
+                exc.status,
+            )
+            return
+        self._send_json(
+            {
+                "auditId": audit_id,
+                "inputHash": record["inputHash"],
+                "replayed": True,
+                "report": report,
+            }
+        )
 
     def do_POST(self) -> None:  # noqa: N802
         parts = urlsplit(self.path)

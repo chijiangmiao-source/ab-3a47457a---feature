@@ -13,6 +13,8 @@ Runs, in order:
    - invalid-event localization + old-success clearing
    - same-input replay and different-input conflict (409)
    - frozen verdict re-read
+   - inheritance-interval audit: two-hop, source-change continuity,
+     release fall-back, no-inheritance task, and actionable failures
 
 Exits 0 only when every phase passes; non-zero otherwise. Compose reports the
 status code via the container's exit status.
@@ -72,7 +74,8 @@ def build_check() -> None:
 # --------------------------------------------------------------------------- #
 def rule_tests() -> None:
     proc = subprocess.run(
-        [sys.executable, "-m", "unittest", "tests.test_rules", "-v"],
+        [sys.executable, "-m", "unittest",
+         "tests.test_rules", "tests.test_inheritance", "-v"],
         cwd=ROOT, capture_output=True, text=True,
     )
     tail = (proc.stderr or proc.stdout).strip().splitlines()[-1] if proc.stderr else ""
@@ -238,6 +241,76 @@ def smoke() -> None:
           and "不存在" in v.get("error", ""),
           "api: unknown object reference located and frozen at index 1",
           f"{v.get('error')}")
+
+    inheritance_smoke()
+
+
+def inheritance_smoke() -> None:
+    """HTTP acceptance for the continuous-inheritance-interval audit."""
+    # --- two-hop: outer holder A boosted across source change B -> C -----
+    status, body = http("GET", "/api/verdicts/VERIFY-TWOHOP/inheritance?taskId=1")
+    report = body.get("report", {})
+    segs = report.get("intervals", [])
+    ok = (
+        status == 200 and report.get("taskId") == 1
+        and report.get("basePriority") == 8
+        and report.get("intervalCount") == 1 and len(segs) == 1
+        and (segs[0]["startEventIndex"], segs[0]["endEventIndex"]) == (3, 4)
+        and segs[0]["mostUrgentPriority"] == 1
+        and segs[0]["sourceTaskIds"] == [2, 3]
+        and segs[0]["startEvidence"]["waitChains"] == [[2, 1]]
+        and [3, 2, 1] in segs[0]["endEvidence"]["waitChains"]
+        and segs[0]["endEvidence"]["taskState"]["inheritedFrom"] == [2, 3]
+    )
+    check(ok, "api: inheritance audit two-hop interval + evidence",
+          f"segments={[(s['startEventIndex'], s['endEventIndex']) for s in segs]}")
+
+    # Middle holder B: events 4..5 (still boosted after A hands L1 over),
+    # source C only.
+    status, body = http("GET", "/api/verdicts/VERIFY-TWOHOP/inheritance?taskId=2")
+    segs = body.get("report", {}).get("intervals", [])
+    check(status == 200 and len(segs) == 1
+          and (segs[0]["startEventIndex"], segs[0]["endEventIndex"]) == (4, 5)
+          and segs[0]["sourceTaskIds"] == [3],
+          "api: inheritance audit middle holder two-hop span", str(body.get("report")))
+
+    # --- release fall-back: single-event interval then back to base ------
+    status, body = http("GET", "/api/verdicts/VERIFY-FALLBACK/inheritance?taskId=1")
+    segs = body.get("report", {}).get("intervals", [])
+    check(status == 200 and len(segs) == 1
+          and (segs[0]["startEventIndex"], segs[0]["endEventIndex"]) == (2, 2)
+          and segs[0]["mostUrgentPriority"] == 1
+          and segs[0]["sourceTaskIds"] == [2],
+          "api: inheritance audit release fallback interval", str(body.get("report")))
+
+    # --- no-inheritance task: urgent waiter never deviates ---------------
+    status, body = http("GET", "/api/verdicts/VERIFY-FALLBACK/inheritance?taskId=2")
+    check(status == 200 and body.get("report", {}).get("intervalCount") == 0
+          and body["report"]["intervals"] == []
+          and body["report"]["basePriority"] == 1,
+          "api: inheritance audit returns empty for never-inheriting task", str(body))
+
+    # --- unknown task within an existing audit ---------------------------
+    status, body = http("GET", "/api/verdicts/VERIFY-TWOHOP/inheritance?taskId=99")
+    check(status == 404 and body.get("error") == "task_not_found"
+          and body.get("availableTaskIds") == [1, 2, 3],
+          "api: inheritance audit unknown task -> actionable 404", str(body))
+
+    # --- malformed taskId -------------------------------------------------
+    status, body = http("GET", "/api/verdicts/VERIFY-TWOHOP/inheritance?taskId=abc")
+    check(status == 400 and body.get("error") == "bad_request",
+          "api: inheritance audit non-integer taskId -> 400", str(body))
+
+    # --- frozen illegal verdict has no auditable snapshot range ----------
+    status, body = http("GET", "/api/verdicts/VERIFY-INVALID/inheritance?taskId=1")
+    check(status == 409 and body.get("error") == "verdict_frozen"
+          and body.get("errorIndex") == 2,
+          "api: inheritance audit on frozen illegal verdict -> actionable 409", str(body))
+
+    # --- read range (audit id) does not exist ----------------------------
+    status, body = http("GET", "/api/verdicts/NO-SUCH-AUDIT/inheritance?taskId=1")
+    check(status == 404 and body.get("error") == "not_found",
+          "api: inheritance audit unknown audit id -> 404", str(body))
 
 
 def main() -> int:
